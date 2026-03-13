@@ -34,7 +34,7 @@ def test_serial():
 
     try:
         ser = serial.Serial(port, 9600, timeout=2)
-        print("Connection opened")
+        print("[*] Connection opened")
         ser.write(b'TEST\n')
         data = ser.readline()
         print("Response:", data)
@@ -52,9 +52,9 @@ def ping_device():
 def test_connection(ip, port):
     try:
         socket.create_connection((ip, port), timeout=3)
-        return "OPEN"
+        return "[*] OPEN"
     except:
-        return "CLOSED"
+        return "[*] CLOSED"
 
 
 def tcp_test():
