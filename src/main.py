@@ -24,6 +24,8 @@ def show_menu():
 
 def list_serial():
     ports = serial.tools.list_ports.comports()
+    if not ports:
+        return print("[*] No serial ports")
     for p in ports:
         print(p.device, "-", p.description)
 
