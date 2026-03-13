@@ -9,7 +9,7 @@ def clear():
 
 
 def show_menu():
-    clear()
+    #clear()
     print("=" * 40)
     print("      POS DIAGNOSTIC TOOLKIT")
     print("=" * 40)
