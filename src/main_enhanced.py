@@ -166,8 +166,8 @@ def test_single_port(port_name: str, baud: int = 9600, timeout: float = 2.0) -> 
 def test_all_ports_sequential():
     """
     Enumerate every available COM/serial port and test each one in sequence.
-    This is the main time-saver: instead of manually testing ports one by one,
-    we scan all of them automatically.
+    Ports are tested one after another — safe and simple.
+    Good for: basic scans, older machines, avoiding device conflicts.
     """
     log.section("SEQUENTIAL PORT SCAN")
 
@@ -181,7 +181,7 @@ def test_all_ports_sequential():
         log.write("  [!] No serial/COM ports detected on this system")
         return
 
-    log.write(f"  Found {len(ports)} port(s). Testing each...\n")
+    log.write(f"  Found {len(ports)} port(s). Testing one by one...\n")
 
     results = []
     for port in ports:
@@ -196,6 +196,69 @@ def test_all_ports_sequential():
 
     ok = sum(1 for r in results if r["status"] in ("OK", "OPEN"))
     log.write(f"\n  Summary: {ok}/{len(results)} ports accessible")
+    return results
+
+
+def test_all_ports_simultaneous():
+    """
+    Test ALL serial/COM ports at the same time using threads.
+    Every port gets its own thread — results come in as fast as the
+    slowest single port (instead of adding up all timeouts).
+
+    Example: 4 ports × 2s timeout = 2s total (not 8s sequential).
+
+    Good for: fast scans on stores with many devices, time-critical calls.
+    Note: May miss responses on devices that conflict when opened together.
+    """
+    log.section("SIMULTANEOUS PORT SCAN (All at Once)")
+
+    if not SERIAL_AVAILABLE:
+        log.write("  [!] pyserial not available — skipping serial tests")
+        return
+
+    ports = list(serial.tools.list_ports.comports())
+
+    if not ports:
+        log.write("  [!] No serial/COM ports detected on this system")
+        return
+
+    log.write(f"  Found {len(ports)} port(s). Testing ALL simultaneously...\n")
+
+    results = {}
+    lock = threading.Lock()  # Prevent garbled output when threads write at same time
+
+    def worker(port):
+        """Thread worker — tests one port and stores result."""
+        res = test_single_port(port.device)
+        with lock:
+            results[port.device] = res
+
+    # Launch one thread per port
+    threads = []
+    start_time = time.time()
+    for port in ports:
+        t = threading.Thread(target=worker, args=(port,))
+        threads.append(t)
+        t.start()
+
+    # Wait for all threads to complete (max 10 seconds total)
+    for t in threads:
+        t.join(timeout=10)
+
+    elapsed = time.time() - start_time
+    log.write(f"  All ports tested in {elapsed:.1f}s\n")
+
+    # Print results in port order
+    for port in ports:
+        res = results.get(port.device, {"status": "TIMEOUT", "device": "?", "error": "thread timeout", "response": ""})
+        log.result(
+            port.device,
+            res["status"],
+            f"{res['device']} | {res['error'] or res['response'] or 'no response'}"
+        )
+
+    ok = sum(1 for r in results.values() if r["status"] in ("OK", "OPEN"))
+    log.write(f"\n  Summary: {ok}/{len(ports)} ports accessible | Time: {elapsed:.1f}s")
     return results
 
 
@@ -373,8 +436,9 @@ def full_diagnostics():
     log.write(f"  OS        : {platform.system()} {platform.release()}")
     log.write(f"  Log file  : {log.log_file}")
 
-    # 1. Serial ports
-    test_all_ports_sequential()
+    # 1. Serial ports — run BOTH sequential and simultaneous for full picture
+    test_all_ports_simultaneous()   # Fast scan first (all at once)
+    test_all_ports_sequential()     # Then sequential for detailed output
 
     # 2. USB devices
     scan_usb_devices()
@@ -403,11 +467,12 @@ def print_menu():
     print(f"  Author: Christian J. Sanchez Avila — AM PM Services")
     print("=" * 60)
     print("  [1] Full System Diagnostics (recommended)")
-    print("  [2] Test Serial Ports (Sequential)")
-    print("  [3] Scan USB Devices")
-    print("  [4] Network Tests (Parallel)")
-    print("  [5] Ping Test")
-    print("  [6] List Saved Configs")
+    print("  [2] Test Serial Ports — Sequential (one by one)")
+    print("  [3] Test Serial Ports — Simultaneous (all at once, fastest)")
+    print("  [4] Scan USB Devices")
+    print("  [5] Network Tests (Parallel)")
+    print("  [6] Ping Test")
+    print("  [7] List Saved Configs")
     print("  [0] Exit")
     print("-" * 60)
 
@@ -435,15 +500,17 @@ def main():
         elif choice == "2":
             test_all_ports_sequential()
         elif choice == "3":
-            scan_usb_devices()
+            test_all_ports_simultaneous()
         elif choice == "4":
-            test_network_parallel()
+            scan_usb_devices()
         elif choice == "5":
+            test_network_parallel()
+        elif choice == "6":
             log.section("PING TEST")
             host = input("  Enter host to ping [default: 8.8.8.8]: ").strip() or "8.8.8.8"
             result = ping_host(host)
             log.result(host, "OK" if "FAIL" not in result else "FAIL", result)
-        elif choice == "6":
+        elif choice == "7":
             log.section("SAVED CONFIGURATIONS")
             list_configs()
         elif choice == "0":
