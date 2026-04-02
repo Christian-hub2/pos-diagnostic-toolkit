@@ -263,8 +263,57 @@ def test_all_ports_simultaneous():
 
 
 # ─────────────────────────────────────────────
-# USB DEVICE SCANNING
+# USB DEVICE SCANNING & CONNECTION TESTING
 # ─────────────────────────────────────────────
+
+# Known POS USB device signatures — used to classify detected devices
+USB_DEVICE_SIGNATURES = {
+    # Vendor ID : (brand, device type)
+    "04b8": ("Epson",         "Printer/Scanner"),
+    "0525": ("Verifone",      "Pin Pad"),
+    "0b00": ("Ingenico",      "Pin Pad/Terminal"),
+    "05e0": ("Symbol/Zebra",  "Scanner"),
+    "0a5f": ("Zebra",         "Scanner/Printer"),
+    "1fc9": ("NCR",           "POS Device"),
+    "0403": ("FTDI",          "USB-Serial Adapter"),
+    "067b": ("Prolific",      "USB-Serial Adapter"),
+    "10c4": ("Silicon Labs",  "USB-Serial Adapter"),
+    "1a86": ("CH340",         "USB-Serial Adapter"),
+    "0557": ("ATEN",          "USB-Serial/KVM"),
+    "045e": ("Microsoft",     "HID/Keyboard/Mouse"),
+    "046d": ("Logitech",      "HID/Keyboard/Mouse"),
+    "0458": ("KYE/Genius",    "HID Device"),
+    "05ac": ("Apple",         "HID/Hub"),
+    "0424": ("Microchip",     "USB Hub"),
+    "2341": ("Arduino",       "USB-Serial"),
+    "0451": ("Texas Instrs",  "USB Hub"),
+    "1d6b": ("Linux",         "USB Hub/Virtual"),
+}
+
+
+def _classify_usb_device(vid: str, desc: str) -> str:
+    """Return a friendly device type label based on vendor ID or description."""
+    vid_lower = vid.lower()
+    match = USB_DEVICE_SIGNATURES.get(vid_lower)
+    if match:
+        return f"{match[0]} — {match[1]}"
+
+    # Fall back to keyword matching on description
+    desc_lower = desc.lower()
+    if any(k in desc_lower for k in ["epson", "receipt", "printer"]):
+        return "Printer"
+    if any(k in desc_lower for k in ["verifone", "ingenico", "pinpad", "pin pad"]):
+        return "Pin Pad"
+    if any(k in desc_lower for k in ["zebra", "symbol", "scanner", "barcode"]):
+        return "Scanner"
+    if any(k in desc_lower for k in ["serial", "com port", "ftdi", "ch340", "prolific"]):
+        return "USB-Serial Adapter"
+    if any(k in desc_lower for k in ["hub"]):
+        return "USB Hub"
+    if any(k in desc_lower for k in ["keyboard", "mouse", "hid"]):
+        return "HID Device"
+    return "Unknown Device"
+
 
 def scan_usb_devices():
     """
@@ -272,40 +321,36 @@ def scan_usb_devices():
     - Windows: PowerShell Get-PnpDevice
     - Linux:   lsusb
     - macOS:   system_profiler
+    Lists all physically connected USB devices.
     """
-    log.section("USB DEVICE SCAN")
+    log.section("USB DEVICE SCAN (Connected Devices)")
 
     os_name = platform.system()
-    log.write(f"  Platform: {os_name}")
+    log.write(f"  Platform: {os_name}\n")
 
     try:
         if os_name == "Windows":
-            # Query PnP devices via PowerShell — returns all USB devices
             cmd = [
                 "powershell", "-Command",
                 "Get-PnpDevice -PresentOnly | Where-Object {$_.InstanceId -like 'USB*'} | "
                 "Select-Object Status, Class, FriendlyName | Format-List"
             ]
             out = subprocess.check_output(cmd, timeout=15, stderr=subprocess.DEVNULL, text=True)
-
         elif os_name == "Linux":
-            # lsusb lists all connected USB devices
             out = subprocess.check_output(["lsusb"], timeout=10, text=True)
-
         elif os_name == "Darwin":
-            # macOS system profiler — USB section
             out = subprocess.check_output(
                 ["system_profiler", "SPUSBDataType"], timeout=15, text=True
             )
         else:
-            log.write(f"  [!] Unsupported platform for USB scan: {os_name}")
+            log.write(f"  [!] Unsupported platform: {os_name}")
             return
 
         if not out.strip():
             log.write("  [!] No USB devices detected")
             return
 
-        log.write("\n  Connected USB Devices:")
+        log.write("  Connected USB Devices:")
         for line in out.strip().splitlines():
             if line.strip():
                 log.write(f"    {line.strip()}")
@@ -316,6 +361,170 @@ def scan_usb_devices():
         log.write("  [!] USB scan timed out")
     except Exception as e:
         log.write(f"  [!] USB scan error: {e}")
+
+
+def test_usb_connections():
+    """
+    Test USB connections — goes beyond just listing devices.
+    For each detected USB device:
+      1. Lists it with Vendor ID and Product ID
+      2. Classifies the device type (printer, scanner, pin pad, etc.)
+      3. Checks if the device is responding (OK / ERROR / UNKNOWN)
+      4. Shows status: OK (driver loaded, responding) vs ERROR (driver issue)
+
+    Windows: uses PowerShell Get-PnpDevice + DeviceID for VID/PID
+    Linux:   uses lsusb -v for detailed info
+    macOS:   uses system_profiler SPUSBDataType
+    """
+    log.section("USB CONNECTION TEST")
+
+    os_name = platform.system()
+    log.write(f"  Platform: {os_name}\n")
+
+    devices = []  # List of dicts: {name, vid, pid, status, device_type}
+
+    try:
+        if os_name == "Windows":
+            # --- Windows: PowerShell query ---
+            # Get all USB devices with their hardware IDs (VID/PID) and status
+            cmd = [
+                "powershell", "-Command",
+                """
+                Get-PnpDevice -PresentOnly |
+                Where-Object { $_.InstanceId -like 'USB*' } |
+                Select-Object Status, FriendlyName, InstanceId |
+                ForEach-Object {
+                    $vid = '';
+                    $pid = '';
+                    if ($_.InstanceId -match 'VID_([0-9A-F]{4})') { $vid = $matches[1] }
+                    if ($_.InstanceId -match 'PID_([0-9A-F]{4})') { $pid = $matches[1] }
+                    [PSCustomObject]@{
+                        Status = $_.Status;
+                        Name = $_.FriendlyName;
+                        VID = $vid;
+                        PID = $pid
+                    }
+                } | ConvertTo-Json
+                """
+            ]
+            raw = subprocess.check_output(cmd, timeout=20, stderr=subprocess.DEVNULL, text=True)
+            items = json.loads(raw) if raw.strip() else []
+            # Handle single device (dict) vs multiple (list)
+            if isinstance(items, dict):
+                items = [items]
+            for item in items:
+                name = item.get("Name") or "Unknown"
+                vid  = (item.get("VID") or "????").lower()
+                pid  = (item.get("PID") or "????").lower()
+                status_raw = item.get("Status", "Unknown")
+                # Map Windows PnP status to OK/ERROR/UNKNOWN
+                if status_raw == "OK":
+                    status = "OK"
+                elif status_raw in ("Error", "Degraded", "Unknown"):
+                    status = "ERROR"
+                else:
+                    status = "WARNING"
+                devices.append({
+                    "name":   name,
+                    "vid":    vid,
+                    "pid":    pid,
+                    "status": status,
+                    "type":   _classify_usb_device(vid, name),
+                })
+
+        elif os_name == "Linux":
+            # --- Linux: lsusb for device list ---
+            raw = subprocess.check_output(["lsusb"], timeout=10, text=True)
+            for line in raw.strip().splitlines():
+                # Format: Bus 001 Device 002: ID 04b8:0202 Seiko Epson Corp. ...
+                parts = line.split()
+                vid_pid = ""
+                name    = line
+                for p in parts:
+                    if ":" in p and len(p) == 9:
+                        vid_pid = p
+                        name = " ".join(parts[parts.index(p)+1:])
+                        break
+                vid = vid_pid.split(":")[0] if ":" in vid_pid else "????"
+                pid = vid_pid.split(":")[1] if ":" in vid_pid else "????"
+                devices.append({
+                    "name":   name or line,
+                    "vid":    vid,
+                    "pid":    pid,
+                    "status": "OK",  # lsusb only lists responding devices
+                    "type":   _classify_usb_device(vid, name),
+                })
+
+        elif os_name == "Darwin":
+            # --- macOS: system_profiler ---
+            raw = subprocess.check_output(
+                ["system_profiler", "SPUSBDataType"], timeout=15, text=True
+            )
+            name = ""
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("USB") and ":" in stripped:
+                    key, _, val = stripped.partition(":")
+                    key = key.strip().lower()
+                    val = val.strip()
+                    if key in ("product id", "vendor id"):
+                        pass
+                    elif not key.startswith("bcd") and val:
+                        name = val
+                        devices.append({
+                            "name":   name,
+                            "vid":    "????",
+                            "pid":    "????",
+                            "status": "OK",
+                            "type":   _classify_usb_device("", name),
+                        })
+        else:
+            log.write(f"  [!] Unsupported platform: {os_name}")
+            return
+
+    except FileNotFoundError:
+        log.write("  [!] USB test tool not found on this system")
+        return
+    except subprocess.TimeoutExpired:
+        log.write("  [!] USB test timed out")
+        return
+    except json.JSONDecodeError:
+        log.write("  [!] Could not parse USB device data")
+        return
+    except Exception as e:
+        log.write(f"  [!] USB test error: {e}")
+        return
+
+    if not devices:
+        log.write("  [!] No USB devices found")
+        return
+
+    log.write(f"  Found {len(devices)} USB device(s):\n")
+    log.write(f"  {'Device':<35} {'VID:PID':<12} {'Type':<28} {'Status'}")
+    log.write(f"  {'-'*35} {'-'*12} {'-'*28} {'-'*8}")
+
+    ok_count = 0
+    for d in devices:
+        vid_pid = f"{d['vid']}:{d['pid']}"
+        log.result(
+            d["name"][:34],
+            d["status"],
+            f"[{vid_pid}] {d['type']}"
+        )
+        if d["status"] == "OK":
+            ok_count += 1
+
+    log.write(f"\n  Summary: {ok_count}/{len(devices)} USB devices responding OK")
+
+    # Flag any errors
+    errors = [d for d in devices if d["status"] != "OK"]
+    if errors:
+        log.write(f"\n  ⚠️  DEVICES WITH ISSUES:")
+        for d in errors:
+            log.write(f"     • {d['name']} [{d['vid']}:{d['pid']}] — {d['status']}")
+        log.write("  → Check Device Manager for driver errors")
+
+    return devices
 
 
 # ─────────────────────────────────────────────
@@ -440,8 +649,9 @@ def full_diagnostics():
     test_all_ports_simultaneous()   # Fast scan first (all at once)
     test_all_ports_sequential()     # Then sequential for detailed output
 
-    # 2. USB devices
+    # 2. USB devices — scan + connection test
     scan_usb_devices()
+    test_usb_connections()
 
     # 3. Network
     test_network_parallel()
@@ -469,10 +679,11 @@ def print_menu():
     print("  [1] Full System Diagnostics (recommended)")
     print("  [2] Test Serial Ports — Sequential (one by one)")
     print("  [3] Test Serial Ports — Simultaneous (all at once, fastest)")
-    print("  [4] Scan USB Devices")
-    print("  [5] Network Tests (Parallel)")
-    print("  [6] Ping Test")
-    print("  [7] List Saved Configs")
+    print("  [4] Scan USB Devices (list all)")
+    print("  [5] Test USB Connections (status + type check)")
+    print("  [6] Network Tests (Parallel)")
+    print("  [7] Ping Test")
+    print("  [8] List Saved Configs")
     print("  [0] Exit")
     print("-" * 60)
 
@@ -504,13 +715,15 @@ def main():
         elif choice == "4":
             scan_usb_devices()
         elif choice == "5":
-            test_network_parallel()
+            test_usb_connections()
         elif choice == "6":
+            test_network_parallel()
+        elif choice == "7":
             log.section("PING TEST")
             host = input("  Enter host to ping [default: 8.8.8.8]: ").strip() or "8.8.8.8"
             result = ping_host(host)
             log.result(host, "OK" if "FAIL" not in result else "FAIL", result)
-        elif choice == "7":
+        elif choice == "8":
             log.section("SAVED CONFIGURATIONS")
             list_configs()
         elif choice == "0":
