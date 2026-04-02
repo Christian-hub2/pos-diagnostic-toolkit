@@ -36,7 +36,7 @@ def check_dependencies():
     """Check if required dependencies are installed"""
     print_step("Checking Dependencies")
     
-    required = ["pyserial", "pyinstaller"]
+    required = ["serial", "PyInstaller"]
     missing = []
     
     for package in required:
