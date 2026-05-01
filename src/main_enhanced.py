@@ -187,7 +187,7 @@ class Logger:
         self.write(line)
 
     def result(self, label: str, status: str, detail: str = ""):
-        icon = "✓" if status.upper() in ("OK", "OPEN", "FOUND", "PASS") else "✗"
+        icon = "[OK]" if status.upper() in ("OK", "OPEN", "FOUND", "PASS") else "[FAIL]"
         msg = f"  {icon} {label:<35} {status}"
         if detail:
             msg += f" — {detail}"
@@ -222,7 +222,7 @@ class Logger:
         if self._structured_entries:
             lines.append("  Results:")
             for e in self._structured_entries:
-                icon = "✓" if e["status"].upper() in ("OK", "OPEN", "FOUND", "PASS") else "✗"
+                icon = "[OK]" if e["status"].upper() in ("OK", "OPEN", "FOUND", "PASS") else "[FAIL]"
                 lines.append(f"    {icon} {e['label']}: {e['status']}")
                 if e["detail"]:
                     lines.append(f"      - {e['detail']}")
@@ -834,7 +834,7 @@ def check_opos_registry():
             out = run_system_command(cmd, timeout=5)
             if out.strip():
                 found_any = True
-                log.write(f"  ✓ {category}:")
+                log.write(f"  [OK] {category}:")
                 for line in out.strip().splitlines():
                     stripped = line.strip()
                     if stripped and "SOFTWARE" in stripped and stripped.endswith(category):
@@ -853,14 +853,14 @@ def check_opos_registry():
             "Try: re-run OPOS configuration, or install from manufacturer's OPOS driver package."
         )
     else:
-        log.write("\n  ✓ OPOS service objects detected — service layer appears configured")
+        log.write("\n  [OK] OPOS service objects detected — service layer appears configured")
 
     # Also check JavaPOS
     for reg_base in JAVAPOS_REGISTRY_PATHS:
         cmd = ["reg", "query", reg_base, "/s"]
         out = run_system_command(cmd, timeout=5)
         if out.strip():
-            log.write(f"\n  ✓ JavaPOS registry keys found at {reg_base}")
+            log.write(f"\n  [OK] JavaPOS registry keys found at {reg_base}")
             log.write("  (JavaPOS control objects detected)")
             return
 
@@ -965,14 +965,14 @@ def save_config():
     if errors:
         log.write("  Validation errors:")
         for err in errors:
-            log.write(f"    ✗ {err}")
+            log.write(f"    [FAIL] {err}")
         return
 
     filepath = CONFIG_DIR / f"{name.replace(' ', '_').lower()}.json"
     with open(filepath, "w") as f:
         json.dump(config, f, indent=2)
 
-    log.write(f"  ✓ Configuration saved to {filepath}")
+    log.write(f"  [OK] Configuration saved to {filepath}")
     log.set_store(name)
 
 
