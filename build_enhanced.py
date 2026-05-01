@@ -83,7 +83,17 @@ def build_exe():
     
     # Run PyInstaller
     import subprocess
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+    except FileNotFoundError:
+        # PyInstaller not on PATH (common on Windows Store Python)
+        try:
+            result = subprocess.run([sys.executable, "-m", "PyInstaller"] + cmd[1:],
+                                   capture_output=True, text=True, shell=True)
+        except Exception as e2:
+            print(f"  [!] Failed to run PyInstaller: {e2}")
+            print(f"  [!] Try running directly: pyinstaller --onefile --console --name=pos-diagnostic-toolkit-v3.1 src/main_enhanced.py")
+            sys.exit(1)
     
     if result.returncode == 0:
         print("[+] Build successful!")
