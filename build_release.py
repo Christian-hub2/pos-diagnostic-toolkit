@@ -152,11 +152,20 @@ def build_executable():
     
     # Run PyInstaller
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print("✓ Build completed successfully")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=True)
+        print("[OK] Build completed successfully")
         return True
+    except FileNotFoundError:
+        try:
+            result = subprocess.run([sys.executable, "-m", "PyInstaller"] + cmd[1:],
+                                   capture_output=True, text=True, check=True, shell=True)
+            print("[OK] Build completed successfully")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[FAIL] Build failed: {e.stderr[:500]}")
+            return False
     except subprocess.CalledProcessError as e:
-        print(f"❌ Build failed with error: {e.stderr}")
+        print(f"[FAIL] Build failed: {e.stderr[:500]}")
         return False
 
 def create_release_package():
