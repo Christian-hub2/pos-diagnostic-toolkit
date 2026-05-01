@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-POS Diagnostic Toolkit v3.0 - Enhanced
+POS Diagnostic Toolkit v3.1 — Enhanced Field Technician Edition
 Author: Christian J. Sanchez Avila
 Company: AM PM Services
 
-A comprehensive field technician utility for diagnosing POS hardware issues.
-Supports serial ports, USB devices, network connectivity, and device-specific testing.
+Fixes in v3.1:
+  - Fixed full_diagnostics() — picks one serial mode (simultaneous), not both
+  - USB PowerShell query retry + timeout + fallback to WMIC
+  - Store-specific network endpoints via config
+  - OPOS/JavaPOS service object checks (Windows registry)
+  - Vendor ID database externalized to vendor_ids.json
+  - Admin/elevation check at startup
+  - Structured ticket output (clean copy-paste block)
+  - Quick Test from Config in menu
 """
 
 import os
@@ -17,9 +24,13 @@ import platform
 import threading
 import subprocess
 import datetime
+import inspect
 from pathlib import Path
 
-# Try importing serial — graceful fallback if not installed
+# ─────────────────────────────────────────────
+# SERIAL AVAILABILITY
+# ─────────────────────────────────────────────
+
 try:
     import serial
     import serial.tools.list_ports
@@ -27,52 +38,123 @@ try:
 except ImportError:
     SERIAL_AVAILABLE = False
 
+
 # ─────────────────────────────────────────────
-# CONFIGURATION
+# FILE PATHS (resolved relative to this script)
 # ─────────────────────────────────────────────
 
-VERSION = "3.0.0"
+SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_DIR = SCRIPT_DIR.parent
+LOG_DIR = PROJECT_DIR / "logs"
+CONFIG_DIR = PROJECT_DIR / "configs"
+DATA_DIR = SCRIPT_DIR / "data"
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# ─────────────────────────────────────────────
+# VERSION
+# ─────────────────────────────────────────────
+
+VERSION = "3.1.0"
 APP_NAME = "POS Diagnostic Toolkit"
-LOG_DIR = Path("logs")
-CONFIG_DIR = Path("configs")
 
-# Device detection patterns — map port descriptions to device types
+
+# ─────────────────────────────────────────────
+# DEVICE DETECTION PATTERNS (hardcoded baseline)
+# ─────────────────────────────────────────────
+
 DEVICE_PATTERNS = {
-    "verifone":  {"keywords": ["verifone", "vx", "mx9"], "test_cmd": b"STATUS\r\n"},
-    "ingenico":  {"keywords": ["ingenico", "ipp", "isc"],  "test_cmd": b"STATUS\r\n"},
-    "epson":     {"keywords": ["epson", "tm-", "receipt"], "test_cmd": bytes([0x1B, 0x40])},  # ESC @
-    "zebra":     {"keywords": ["zebra", "symbol", "ls"],   "test_cmd": bytes([0x05])},         # ENQ
-    "scale":     {"keywords": ["scale", "mettler", "toledo"], "test_cmd": b"W\r\n"},
-    "cashdrawer":{"keywords": ["cash", "drawer", "apd"],   "test_cmd": bytes([0x1B, 0x70, 0x00, 0x19, 0xFA])},
+    "verifone":   {"keywords": ["verifone", "vx", "mx9"],  "test_cmd": b"STATUS\r\n"},
+    "ingenico":   {"keywords": ["ingenico", "ipp", "isc"], "test_cmd": b"STATUS\r\n"},
+    "epson":      {"keywords": ["epson", "tm-", "receipt"], "test_cmd": bytes([0x1B, 0x40])},
+    "zebra":      {"keywords": ["zebra", "symbol", "ls"],  "test_cmd": bytes([0x05])},
+    "scale":      {"keywords": ["scale", "mettler", "toledo"], "test_cmd": b"W\r\n"},
+    "cashdrawer": {"keywords": ["cash", "drawer", "apd"],   "test_cmd": bytes([0x1B, 0x70, 0x00, 0x19, 0xFA])},
 }
 
-# Common network endpoints to check
-NETWORK_ENDPOINTS = [
-    ("8.8.8.8",     53,  "Google DNS"),
-    ("8.8.4.4",     53,  "Google DNS 2"),
-    ("1.1.1.1",     53,  "Cloudflare DNS"),
-    ("192.168.1.1",  80,  "Default Gateway"),
-    ("localhost",    9100,"Epson ePOS"),
-    ("localhost",    80,  "HTTP"),
-    ("localhost",    443, "HTTPS"),
-]
+# ─────────────────────────────────────────────
+# VENDOR ID DATABASE — loaded from external file
+# ─────────────────────────────────────────────
+
+def _load_vendor_db() -> dict:
+    """
+    Load USB vendor ID database from external file.
+    Ships with built-in defaults; users can add new VID entries without recompiling.
+    """
+    fallback = {
+        "04b8": ("Epson",        "Printer/Scanner"),
+        "0525": ("Verifone",     "Pin Pad"),
+        "0b00": ("Ingenico",     "Pin Pad/Terminal"),
+        "05e0": ("Symbol/Zebra", "Scanner"),
+        "0a5f": ("Zebra",        "Scanner/Printer"),
+        "1fc9": ("NCR",          "POS Device"),
+        "0403": ("FTDI",         "USB-Serial Adapter"),
+        "067b": ("Prolific",     "USB-Serial Adapter"),
+        "10c4": ("Silicon Labs", "USB-Serial Adapter"),
+        "1a86": ("CH340",        "USB-Serial Adapter"),
+        "0557": ("ATEN",         "USB-Serial/KVM"),
+        "045e": ("Microsoft",    "HID/Keyboard/Mouse"),
+        "046d": ("Logitech",     "HID/Keyboard/Mouse"),
+        "0458": ("KYE/Genius",   "HID Device"),
+        "05ac": ("Apple",        "HID/Hub"),
+        "0424": ("Microchip",    "USB Hub"),
+        "2341": ("Arduino",      "USB-Serial"),
+        "0451": ("Texas Instrs", "USB Hub"),
+        "1d6b": ("Linux",        "USB Hub/Virtual"),
+    }
+    vendor_file = DATA_DIR / "vendor_ids.json"
+    if vendor_file.is_file():
+        try:
+            with open(vendor_file) as f:
+                user_data = json.load(f)
+            fallback.update(user_data)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return fallback
+
+USB_DEVICE_SIGNATURES = _load_vendor_db()
 
 
 # ─────────────────────────────────────────────
-# LOGGING
+# DEFAULT NETWORK ENDPOINTS
+# ─────────────────────────────────────────────
+
+DEFAULT_NETWORK_ENDPOINTS = [
+    ("8.8.8.8",     53,  "Google DNS"),
+    ("8.8.4.4",     53,  "Google DNS 2"),
+    ("192.168.1.1",  80,  "Default Gateway"),
+]
+
+STORE_CONFIG_REQUIRED_FIELDS = {
+    "store_name": str,
+    "store_address": str,
+    "endpoints": list,
+    "notes": str,
+}
+
+
+# ─────────────────────────────────────────────
+# LOGGER
 # ─────────────────────────────────────────────
 
 class Logger:
-    """Simple file + console logger for field use."""
+    """File + console logger. Also captures structured ticket output."""
 
     def __init__(self):
-        LOG_DIR.mkdir(exist_ok=True)
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         self.log_file = LOG_DIR / f"pos-diag-{today}.log"
         self._buf = []
+        self._structured_entries = []
+        self._store_name = None
+        self._troubleshooting_notes = []
+
+    def set_store(self, name: str):
+        self._store_name = name
 
     def write(self, text: str):
-        """Write to console and log file simultaneously."""
         print(text)
         self._buf.append(text)
         with open(self.log_file, "a") as f:
@@ -90,17 +172,119 @@ class Logger:
         if detail:
             msg += f" — {detail}"
         self.write(msg)
+        self._structured_entries.append({
+            "label": label, "status": status, "detail": detail,
+            "timestamp": datetime.datetime.now().isoformat()
+        })
 
-    def flush_to_clipboard(self):
-        """Print a copyable block for ticket remarks."""
-        self.write("\n" + "─" * 60)
-        self.write("  COPY BELOW FOR TICKET REMARKS:")
-        self.write("─" * 60)
-        for line in self._buf[-40:]:
-            print(line)
+    def add_troubleshooting_note(self, note: str):
+        """Add a note that goes into the ticket remarks section."""
+        self._troubleshooting_notes.append(note)
+        self.write(f"  [*] Note: {note}")
+
+    def get_ticket_remarks(self) -> str:
+        """
+        Generate a clean, structured ticket remark block.
+        Ready to copy-paste into AM PM work order system.
+        """
+        now = datetime.datetime.now()
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  TICKET REMARKS — Copy below into work order")
+        lines.append("=" * 60)
+        lines.append(f"  Date: {now.strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"  Tech: Christian Sanchez")
+        if self._store_name:
+            lines.append(f"  Store: {self._store_name}")
+        lines.append(f"  Tool: {APP_NAME} v{VERSION}")
+        lines.append("")
+
+        if self._structured_entries:
+            lines.append("  Results:")
+            for e in self._structured_entries:
+                icon = "✓" if e["status"].upper() in ("OK", "OPEN", "FOUND", "PASS") else "✗"
+                lines.append(f"    {icon} {e['label']}: {e['status']}")
+                if e["detail"]:
+                    lines.append(f"      - {e['detail']}")
+
+        if self._troubleshooting_notes:
+            lines.append("")
+            lines.append("  Troubleshooting Notes:")
+            for note in self._troubleshooting_notes:
+                lines.append(f"    • {note}")
+
+        lines.append("")
+        lines.append(f"  Log file: {self.log_file}")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    def print_ticket_block(self):
+        """Print the structured ticket block to console."""
+        print("\n" + self.get_ticket_remarks())
 
 
 log = Logger()
+
+
+# ─────────────────────────────────────────────
+# ADMIN / ELEVATION CHECK
+# ─────────────────────────────────────────────
+
+def is_admin() -> bool:
+    """Check if the process has admin/root privileges."""
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+    else:
+        return os.geteuid() == 0
+
+
+def check_elevation():
+    """Warn if not running as admin. On Windows, offer to relaunch."""
+    if is_admin():
+        log.write("  ✓ Running with admin privileges")
+        return
+
+    log.write("  ⚠ WARNING: Not running as administrator")
+    log.write("  Some features (serial ports, USB scanning) may not work fully.")
+    log.write("  Recommend restarting with admin rights.")
+
+    if platform.system() == "Windows":
+        log.write("  → Right-click the .exe and select 'Run as Administrator'")
+        log.write("  → Or run from an elevated Command Prompt")
+
+    log.add_troubleshooting_note(
+        "Ran without admin elevation. Some USB/serial operations may have limited results."
+    )
+
+
+# ─────────────────────────────────────────────
+# ELEVATION-AWARE TOOL RUNNER
+# ─────────────────────────────────────────────
+
+def run_system_command(cmd: list, timeout: int = 15) -> str:
+    """
+    Run a system command with timeout and error handling.
+    Returns stdout string or empty on failure.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+        )
+        return result.stdout or ""
+    except subprocess.TimeoutExpired:
+        log.add_troubleshooting_note(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+        return ""
+    except Exception as e:
+        log.write(f"  [!] Command failed: {e}")
+        return ""
 
 
 # ─────────────────────────────────────────────
@@ -108,7 +292,6 @@ log = Logger()
 # ─────────────────────────────────────────────
 
 def detect_device_type(port_description: str) -> str:
-    """Identify device type from port description string."""
     desc_lower = port_description.lower()
     for device, info in DEVICE_PATTERNS.items():
         if any(kw in desc_lower for kw in info["keywords"]):
@@ -117,10 +300,6 @@ def detect_device_type(port_description: str) -> str:
 
 
 def test_single_port(port_name: str, baud: int = 9600, timeout: float = 2.0) -> dict:
-    """
-    Open a serial port, detect device type, send a test command,
-    and return a result dictionary.
-    """
     result = {
         "port": port_name,
         "status": "FAIL",
@@ -128,7 +307,6 @@ def test_single_port(port_name: str, baud: int = 9600, timeout: float = 2.0) -> 
         "response": "",
         "error": "",
     }
-
     if not SERIAL_AVAILABLE:
         result["error"] = "pyserial not installed"
         return result
@@ -136,104 +314,51 @@ def test_single_port(port_name: str, baud: int = 9600, timeout: float = 2.0) -> 
     try:
         with serial.Serial(port_name, baud, timeout=timeout) as ser:
             result["status"] = "OPEN"
-
-            # Get device type from port description
             ports = {p.device: p for p in serial.tools.list_ports.comports()}
             desc = ports.get(port_name, None)
             desc_str = desc.description if desc else ""
             device_type = detect_device_type(desc_str)
             result["device"] = device_type
-
-            # Send test command specific to device type
             cmd = DEVICE_PATTERNS.get(device_type, {}).get("test_cmd", b"TEST\r\n")
             ser.write(cmd)
             time.sleep(0.5)
-
-            # Read response (up to 64 bytes)
             if ser.in_waiting:
                 raw = ser.read(64)
                 result["response"] = raw.hex()
                 result["status"] = "OK"
-
     except serial.SerialException as e:
         result["error"] = str(e)
     except Exception as e:
         result["error"] = f"Unexpected: {e}"
-
     return result
-
-
-def test_all_ports_sequential():
-    """
-    Enumerate every available COM/serial port and test each one in sequence.
-    Ports are tested one after another — safe and simple.
-    Good for: basic scans, older machines, avoiding device conflicts.
-    """
-    log.section("SEQUENTIAL PORT SCAN")
-
-    if not SERIAL_AVAILABLE:
-        log.write("  [!] pyserial not available — skipping serial tests")
-        return
-
-    ports = list(serial.tools.list_ports.comports())
-
-    if not ports:
-        log.write("  [!] No serial/COM ports detected on this system")
-        return
-
-    log.write(f"  Found {len(ports)} port(s). Testing one by one...\n")
-
-    results = []
-    for port in ports:
-        log.write(f"  Testing {port.device} ({port.description})...")
-        res = test_single_port(port.device)
-        results.append(res)
-        log.result(
-            port.device,
-            res["status"],
-            f"{res['device']} | {res['error'] or res['response'] or 'no response'}"
-        )
-
-    ok = sum(1 for r in results if r["status"] in ("OK", "OPEN"))
-    log.write(f"\n  Summary: {ok}/{len(results)} ports accessible")
-    return results
 
 
 def test_all_ports_simultaneous():
     """
-    Test ALL serial/COM ports at the same time using threads.
-    Every port gets its own thread — results come in as fast as the
-    slowest single port (instead of adding up all timeouts).
-
-    Example: 4 ports × 2s timeout = 2s total (not 8s sequential).
-
-    Good for: fast scans on stores with many devices, time-critical calls.
-    Note: May miss responses on devices that conflict when opened together.
+    Test ALL serial/COM ports simultaneously using threads.
+    This is the primary scan mode — fast, non-blocking for the user.
     """
-    log.section("SIMULTANEOUS PORT SCAN (All at Once)")
+    log.section("SERIAL PORT SCAN (Simultaneous — All at Once)")
 
     if not SERIAL_AVAILABLE:
         log.write("  [!] pyserial not available — skipping serial tests")
-        return
+        return []
 
     ports = list(serial.tools.list_ports.comports())
-
     if not ports:
-        log.write("  [!] No serial/COM ports detected on this system")
-        return
+        log.write("  [!] No serial/COM ports detected")
+        return []
 
-    log.write(f"  Found {len(ports)} port(s). Testing ALL simultaneously...\n")
+    log.write(f"  Found {len(ports)} port(s). Testing all simultaneously...\n")
 
     results = {}
-    lock = threading.Lock()  # Prevent garbled output when threads write at same time
+    lock = threading.Lock()
 
     def worker(port):
-        """Thread worker — tests one port and stores result."""
         res = test_single_port(port.device)
         with lock:
             results[port.device] = res
 
-    # Launch one thread per port
     threads = []
     start_time = time.time()
     for port in ports:
@@ -241,64 +366,38 @@ def test_all_ports_simultaneous():
         threads.append(t)
         t.start()
 
-    # Wait for all threads to complete (max 10 seconds total)
     for t in threads:
         t.join(timeout=10)
 
     elapsed = time.time() - start_time
     log.write(f"  All ports tested in {elapsed:.1f}s\n")
 
-    # Print results in port order
+    accessible = 0
     for port in ports:
-        res = results.get(port.device, {"status": "TIMEOUT", "device": "?", "error": "thread timeout", "response": ""})
+        res = results.get(port.device, {"status": "TIMEOUT", "device": "?", "error": "timeout", "response": ""})
+        if res["status"] in ("OK", "OPEN"):
+            accessible += 1
         log.result(
             port.device,
             res["status"],
             f"{res['device']} | {res['error'] or res['response'] or 'no response'}"
         )
+        if res["error"] and "Access denied" in res.get("error", ""):
+            log.add_troubleshooting_note(f"{port.device} — access denied. Try running as admin.")
 
-    ok = sum(1 for r in results.values() if r["status"] in ("OK", "OPEN"))
-    log.write(f"\n  Summary: {ok}/{len(ports)} ports accessible | Time: {elapsed:.1f}s")
-    return results
+    log.write(f"\n  Summary: {accessible}/{len(ports)} ports accessible | Time: {elapsed:.1f}s")
+    return list(results.values())
 
 
 # ─────────────────────────────────────────────
-# USB DEVICE SCANNING & CONNECTION TESTING
+# USB DEVICE SCANNING
 # ─────────────────────────────────────────────
-
-# Known POS USB device signatures — used to classify detected devices
-USB_DEVICE_SIGNATURES = {
-    # Vendor ID : (brand, device type)
-    "04b8": ("Epson",         "Printer/Scanner"),
-    "0525": ("Verifone",      "Pin Pad"),
-    "0b00": ("Ingenico",      "Pin Pad/Terminal"),
-    "05e0": ("Symbol/Zebra",  "Scanner"),
-    "0a5f": ("Zebra",         "Scanner/Printer"),
-    "1fc9": ("NCR",           "POS Device"),
-    "0403": ("FTDI",          "USB-Serial Adapter"),
-    "067b": ("Prolific",      "USB-Serial Adapter"),
-    "10c4": ("Silicon Labs",  "USB-Serial Adapter"),
-    "1a86": ("CH340",         "USB-Serial Adapter"),
-    "0557": ("ATEN",          "USB-Serial/KVM"),
-    "045e": ("Microsoft",     "HID/Keyboard/Mouse"),
-    "046d": ("Logitech",      "HID/Keyboard/Mouse"),
-    "0458": ("KYE/Genius",    "HID Device"),
-    "05ac": ("Apple",         "HID/Hub"),
-    "0424": ("Microchip",     "USB Hub"),
-    "2341": ("Arduino",       "USB-Serial"),
-    "0451": ("Texas Instrs",  "USB Hub"),
-    "1d6b": ("Linux",         "USB Hub/Virtual"),
-}
-
 
 def _classify_usb_device(vid: str, desc: str) -> str:
-    """Return a friendly device type label based on vendor ID or description."""
     vid_lower = vid.lower()
     match = USB_DEVICE_SIGNATURES.get(vid_lower)
     if match:
         return f"{match[0]} — {match[1]}"
-
-    # Fall back to keyword matching on description
     desc_lower = desc.lower()
     if any(k in desc_lower for k in ["epson", "receipt", "printer"]):
         return "Printer"
@@ -315,315 +414,536 @@ def _classify_usb_device(vid: str, desc: str) -> str:
     return "Unknown Device"
 
 
+def scan_usb_devices_windows_powershell() -> str:
+    """
+    Get USB device list via PowerShell, with retry logic.
+    Returns raw text output.
+    """
+    ps_script = """
+    Get-PnpDevice -PresentOnly |
+        Where-Object { $_.InstanceId -like 'USB*' } |
+        Select-Object Status, Class, FriendlyName, DeviceID |
+        ConvertTo-Json -Compress
+    """
+    for attempt in range(2):
+        out = run_system_command(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            timeout=20
+        )
+        if out.strip():
+            return out
+        if attempt == 0:
+            log.write("  [!] PowerShell query incomplete, retrying once...")
+            time.sleep(1)
+    return ""
+
+
+def scan_usb_devices_windows_wmic() -> str:
+    """Fallback: use WMIC to list USB devices."""
+    log.write("  [*] Falling back to WMIC...")
+    out = run_system_command(
+        ["wmic", "path", "Win32_USBControllerDevice", "get", "/format:list"],
+        timeout=15
+    )
+    return out
+
+
 def scan_usb_devices():
-    """
-    Detect USB devices using platform-specific tools:
-    - Windows: PowerShell Get-PnpDevice
-    - Linux:   lsusb
-    - macOS:   system_profiler
-    Lists all physically connected USB devices.
-    """
-    log.section("USB DEVICE SCAN (Connected Devices)")
+    log.section("USB DEVICE SCAN")
 
     os_name = platform.system()
     log.write(f"  Platform: {os_name}\n")
 
     try:
         if os_name == "Windows":
-            cmd = [
-                "powershell", "-Command",
-                "Get-PnpDevice -PresentOnly | Where-Object {$_.InstanceId -like 'USB*'} | "
-                "Select-Object Status, Class, FriendlyName | Format-List"
-            ]
-            out = subprocess.check_output(cmd, timeout=15, stderr=subprocess.DEVNULL, text=True)
+            raw = scan_usb_devices_windows_powershell()
+            if not raw.strip():
+                log.write("  [!] PowerShell method returned nothing")
+                raw = scan_usb_devices_windows_wmic()
+            if raw.strip():
+                log.write("  Connected USB Devices:")
+                # Try parsing as JSON (PowerShell array output)
+                devices = []
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        devices = parsed
+                    elif isinstance(parsed, dict):
+                        devices = [parsed]
+                except json.JSONDecodeError:
+                    # Not valid JSON — just dump raw output
+                    for line in raw.strip().splitlines():
+                        if line.strip():
+                            log.write(f"    {line.strip()}")
+                    return
+
+                for dev in devices:
+                    fn = dev.get("FriendlyName", "") or dev.get("friendlyName", "") or ""
+                    status = dev.get("Status", "") or dev.get("status", "") or ""
+                    dev_id = dev.get("DeviceID", "") or dev.get("deviceID", "") or ""
+                    cls = dev.get("Class", "") or dev.get("class", "") or ""
+                    # Extract VID from DeviceID
+                    vid = ""
+                    if "VID_" in dev_id.upper():
+                        parts = dev_id.upper().split("VID_")
+                        if len(parts) > 1:
+                            vid = parts[1][:4].lower()
+                    if not vid and fn:
+                        # Fallback to description keywords
+                        pass
+                    device_type = _classify_usb_device(vid, fn)
+                    log.write(f"    • {fn or 'Unknown Device'}")
+                    log.write(f"      Status: {status or 'Unknown'} | Class: {cls or 'N/A'} | Type: {device_type}")
+
         elif os_name == "Linux":
-            out = subprocess.check_output(["lsusb"], timeout=10, text=True)
+            raw = run_system_command(["lsusb"], timeout=10)
+            if raw.strip():
+                log.write("  Connected USB Devices:")
+                for line in raw.strip().splitlines():
+                    if line.strip():
+                        log.write(f"    {line.strip()}")
+
         elif os_name == "Darwin":
-            out = subprocess.check_output(
-                ["system_profiler", "SPUSBDataType"], timeout=15, text=True
-            )
+            raw = run_system_command(["system_profiler", "SPUSBDataType"], timeout=15)
+            if raw.strip():
+                log.write("  Connected USB Devices:")
+                for line in raw.strip().splitlines():
+                    if line.strip():
+                        log.write(f"    {line.strip()}")
+
         else:
             log.write(f"  [!] Unsupported platform: {os_name}")
-            return
 
-        if not out.strip():
-            log.write("  [!] No USB devices detected")
-            return
-
-        log.write("  Connected USB Devices:")
-        for line in out.strip().splitlines():
-            if line.strip():
-                log.write(f"    {line.strip()}")
-
-    except FileNotFoundError:
-        log.write("  [!] USB scan tool not found on this system")
-    except subprocess.TimeoutExpired:
-        log.write("  [!] USB scan timed out")
     except Exception as e:
         log.write(f"  [!] USB scan error: {e}")
+        log.add_troubleshooting_note(f"USB scan failed: {e}")
 
 
 def test_usb_connections():
     """
-    Test USB connections — goes beyond just listing devices.
-    For each detected USB device:
-      1. Lists it with Vendor ID and Product ID
-      2. Classifies the device type (printer, scanner, pin pad, etc.)
-      3. Checks if the device is responding (OK / ERROR / UNKNOWN)
-      4. Shows status: OK (driver loaded, responding) vs ERROR (driver issue)
-
-    Windows: uses PowerShell Get-PnpDevice + DeviceID for VID/PID
-    Linux:   uses lsusb -v for detailed info
-    macOS:   uses system_profiler SPUSBDataType
+    Test USB device connections using platform-specific techniques.
+    On Windows, uses PowerShell to get USB device status.
     """
     log.section("USB CONNECTION TEST")
 
     os_name = platform.system()
     log.write(f"  Platform: {os_name}\n")
-
-    devices = []  # List of dicts: {name, vid, pid, status, device_type}
+    batch = 0
+    errors = 0
 
     try:
         if os_name == "Windows":
-            # --- Windows: PowerShell query ---
-            # Get all USB devices with their hardware IDs (VID/PID) and status
-            cmd = [
-                "powershell", "-Command",
-                """
-                Get-PnpDevice -PresentOnly |
-                Where-Object { $_.InstanceId -like 'USB*' } |
-                Select-Object Status, FriendlyName, InstanceId |
-                ForEach-Object {
-                    $vid = '';
-                    $pid = '';
-                    if ($_.InstanceId -match 'VID_([0-9A-F]{4})') { $vid = $matches[1] }
-                    if ($_.InstanceId -match 'PID_([0-9A-F]{4})') { $pid = $matches[1] }
-                    [PSCustomObject]@{
-                        Status = $_.Status;
-                        Name = $_.FriendlyName;
-                        VID = $vid;
-                        PID = $pid
-                    }
-                } | ConvertTo-Json
-                """
-            ]
-            raw = subprocess.check_output(cmd, timeout=20, stderr=subprocess.DEVNULL, text=True)
-            items = json.loads(raw) if raw.strip() else []
-            # Handle single device (dict) vs multiple (list)
-            if isinstance(items, dict):
-                items = [items]
-            for item in items:
-                name = item.get("Name") or "Unknown"
-                vid  = (item.get("VID") or "????").lower()
-                pid  = (item.get("PID") or "????").lower()
-                status_raw = item.get("Status", "Unknown")
-                # Map Windows PnP status to OK/ERROR/UNKNOWN
-                if status_raw == "OK":
-                    status = "OK"
-                elif status_raw in ("Error", "Degraded", "Unknown"):
-                    status = "ERROR"
+            raw = scan_usb_devices_windows_powershell()
+            if not raw.strip():
+                raw = scan_usb_devices_windows_wmic()
+
+            if not raw.strip():
+                log.write("  [!] Could not retrieve USB device info")
+                return
+
+            devices = []
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    devices = parsed
+                elif isinstance(parsed, dict):
+                    devices = [parsed]
+            except json.JSONDecodeError:
+                log.write("  Could not parse device list (raw output below):")
+                for line in raw.strip().splitlines():
+                    if line.strip():
+                        log.write(f"    {line.strip()}")
+                return
+
+            for dev in devices:
+                batch += 1
+                fn = dev.get("FriendlyName", "") or ""
+                status = dev.get("Status", "") or ""
+                dev_id = dev.get("DeviceID", "") or ""
+
+                is_ok = status.lower() == "ok"
+                if is_ok:
+                    log.result(fn or f"Device #{batch}", "OK")
                 else:
-                    status = "WARNING"
-                devices.append({
-                    "name":   name,
-                    "vid":    vid,
-                    "pid":    pid,
-                    "status": status,
-                    "type":   _classify_usb_device(vid, name),
-                })
+                    errors += 1
+                    log.result(fn or f"Device #{batch}", status.upper() or "UNKNOWN", dev_id)
+
+            total = len(devices)
+            log.write(f"\n  Summary: {total - errors}/{total} devices OK")
+            if errors:
+                log.add_troubleshooting_note(f"{errors} USB device(s) with non-OK status")
 
         elif os_name == "Linux":
-            # --- Linux: lsusb for device list ---
-            raw = subprocess.check_output(["lsusb"], timeout=10, text=True)
-            for line in raw.strip().splitlines():
-                # Format: Bus 001 Device 002: ID 04b8:0202 Seiko Epson Corp. ...
-                parts = line.split()
-                vid_pid = ""
-                name    = line
-                for p in parts:
-                    if ":" in p and len(p) == 9:
-                        vid_pid = p
-                        name = " ".join(parts[parts.index(p)+1:])
-                        break
-                vid = vid_pid.split(":")[0] if ":" in vid_pid else "????"
-                pid = vid_pid.split(":")[1] if ":" in vid_pid else "????"
-                devices.append({
-                    "name":   name or line,
-                    "vid":    vid,
-                    "pid":    pid,
-                    "status": "OK",  # lsusb only lists responding devices
-                    "type":   _classify_usb_device(vid, name),
-                })
+            raw = run_system_command(["lsusb", "-v"], timeout=10)
+            if raw.strip():
+                for line in raw.strip().splitlines():
+                    if "Bus" in line and "Device" in line:
+                        batch += 1
+                        log.write(f"  • {line.strip()}")
+            log.write(f"\n  Summary: {batch} USB device(s) detected")
 
         elif os_name == "Darwin":
-            # --- macOS: system_profiler ---
-            raw = subprocess.check_output(
-                ["system_profiler", "SPUSBDataType"], timeout=15, text=True
-            )
-            name = ""
-            for line in raw.splitlines():
-                stripped = line.strip()
-                if stripped and not stripped.startswith("USB") and ":" in stripped:
-                    key, _, val = stripped.partition(":")
-                    key = key.strip().lower()
-                    val = val.strip()
-                    if key in ("product id", "vendor id"):
-                        pass
-                    elif not key.startswith("bcd") and val:
-                        name = val
-                        devices.append({
-                            "name":   name,
-                            "vid":    "????",
-                            "pid":    "????",
-                            "status": "OK",
-                            "type":   _classify_usb_device("", name),
-                        })
+            raw = run_system_command(["system_profiler", "SPUSBDataType"], timeout=15)
+            if raw.strip():
+                for line in raw.strip().splitlines():
+                    st = line.strip()
+                    if st and not st.startswith(" ") and ":" in st:
+                        batch += 1
+                        log.write(f"  • {st}")
+            log.write(f"\n  Summary: {batch} USB device(s) detected")
+
         else:
             log.write(f"  [!] Unsupported platform: {os_name}")
-            return
 
-    except FileNotFoundError:
-        log.write("  [!] USB test tool not found on this system")
-        return
-    except subprocess.TimeoutExpired:
-        log.write("  [!] USB test timed out")
-        return
-    except json.JSONDecodeError:
-        log.write("  [!] Could not parse USB device data")
-        return
     except Exception as e:
-        log.write(f"  [!] USB test error: {e}")
-        return
-
-    if not devices:
-        log.write("  [!] No USB devices found")
-        return
-
-    log.write(f"  Found {len(devices)} USB device(s):\n")
-    log.write(f"  {'Device':<35} {'VID:PID':<12} {'Type':<28} {'Status'}")
-    log.write(f"  {'-'*35} {'-'*12} {'-'*28} {'-'*8}")
-
-    ok_count = 0
-    for d in devices:
-        vid_pid = f"{d['vid']}:{d['pid']}"
-        log.result(
-            d["name"][:34],
-            d["status"],
-            f"[{vid_pid}] {d['type']}"
-        )
-        if d["status"] == "OK":
-            ok_count += 1
-
-    log.write(f"\n  Summary: {ok_count}/{len(devices)} USB devices responding OK")
-
-    # Flag any errors
-    errors = [d for d in devices if d["status"] != "OK"]
-    if errors:
-        log.write(f"\n  ⚠️  DEVICES WITH ISSUES:")
-        for d in errors:
-            log.write(f"     • {d['name']} [{d['vid']}:{d['pid']}] — {d['status']}")
-        log.write("  → Check Device Manager for driver errors")
-
-    return devices
+        log.write(f"  [!] USB connection test error: {e}")
+        log.add_troubleshooting_note(f"USB connection test error: {e}")
 
 
 # ─────────────────────────────────────────────
 # NETWORK TESTING
 # ─────────────────────────────────────────────
 
-def test_tcp_port(host: str, port: int, timeout: float = 2.0) -> bool:
-    """Attempt a TCP connection to host:port. Returns True if successful."""
+def _test_tcp_endpoint(ip: str, port: int, label: str, results: dict, lock: threading.Lock):
+    """Test a single TCP endpoint and store the result."""
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return False
+        start = time.time()
+        sock = socket.create_connection((ip, port), timeout=3)
+        elapsed = int((time.time() - start) * 1000)
+        sock.close()
+        status = f"OPEN ({elapsed}ms)"
+    except Exception:
+        status = "CLOSED"
+
+    with lock:
+        results[(ip, port)] = (label, status)
 
 
-def test_network_parallel():
+def test_network_parallel(endpoints: list = None):
     """
-    Test multiple network endpoints simultaneously using threads.
-    Much faster than sequential testing — all endpoints checked at once.
+    Test all network endpoints in parallel.
+    Accepts optional store-specific endpoints from config.
+    Defaults to DNS + gateway if no config provided.
     """
-    log.section("PARALLEL NETWORK TESTS")
+    if endpoints is None:
+        endpoints = DEFAULT_NETWORK_ENDPOINTS
+
+    log.section(f"NETWORK TEST (Parallel — {len(endpoints)} endpoints)")
 
     results = {}
-
-    def worker(host, port, label):
-        status = "OPEN" if test_tcp_port(host, port) else "CLOSED"
-        results[label] = status
+    lock = threading.Lock()
 
     threads = []
-    for host, port, label in NETWORK_ENDPOINTS:
-        t = threading.Thread(target=worker, args=(host, port, label))
+    for ip, port, label in endpoints:
+        t = threading.Thread(target=_test_tcp_endpoint, args=(ip, port, label, results, lock))
         threads.append(t)
         t.start()
 
-    # Wait for all threads to finish (max 5 seconds)
     for t in threads:
         t.join(timeout=5)
 
-    for label, status in results.items():
-        log.result(label, status)
+    open_count = 0
+    for (ip, port), (label, status) in sorted(results.items()):
+        is_open = status.startswith("OPEN")
+        if is_open:
+            open_count += 1
+        log.result(label, status, f"{ip}:{port}")
 
-    open_count = sum(1 for s in results.values() if s == "OPEN")
-    log.write(f"\n  Summary: {open_count}/{len(results)} endpoints reachable")
+    log.write(f"\n  Summary: {open_count}/{len(endpoints)} endpoints reachable")
+    if open_count < len(endpoints):
+        log.add_troubleshooting_note(f"{len(endpoints) - open_count} endpoint(s) unreachable — check network connectivity")
 
 
-def ping_host(host: str) -> str:
-    """
-    Ping a host once. Returns latency string or 'FAIL'.
-    Works on both Windows and Linux/macOS.
-    """
-    flag = "-n" if platform.system() == "Windows" else "-c"
+def ping_host(host: str, count: int = 2) -> str:
+    """Ping a host and return result string."""
+    system = platform.system().lower()
+    flag = "-n" if system == "windows" else "-c"
     try:
-        out = subprocess.check_output(
-            ["ping", flag, "1", host],
-            timeout=5, stderr=subprocess.DEVNULL, text=True
+        result = subprocess.run(
+            ["ping", flag, str(count), host],
+            capture_output=True, text=True,
+            timeout=10
         )
-        # Extract ms from output
-        for line in out.splitlines():
-            if "ms" in line.lower() or "time=" in line.lower():
-                return line.strip()
-        return "OK"
-    except Exception:
-        return "FAIL"
+        if "ttl=" in result.stdout.lower():
+            return "Reachable"
+        else:
+            return f"FAIL — no response"
+    except subprocess.TimeoutExpired:
+        return "FAIL — timeout"
+    except Exception as e:
+        return f"FAIL — {e}"
+
+
+# ─────────────────────────────────────────────
+# OPOS / JavaPOS CHECKS (Windows-only)
+# ─────────────────────────────────────────────
+
+OPOS_REGISTRY_PATHS = [
+    r"HKLM\SOFTWARE\WOW6432Node\OLEforRetail\OPOS",
+    r"HKLM\SOFTWARE\OLEforRetail\OPOS",
+]
+
+OPOS_DEVICE_CATEGORIES = [
+    "CashDrawer",
+    "CheckScanner",
+    "CoinDispenser",
+    "FiscalPrinter",
+    "Keylock",
+    "LineDisplay",
+    "MICR",
+    "MSR",
+    "PINPad",
+    "POSKeyboard",
+    "POSPrinter",
+    "RemoteOrderDisplay",
+    "Scanner",
+    "SignatureCapture",
+    "SmartCardRW",
+    "ToneIndicator",
+]
+
+JAVAPOS_REGISTRY_PATHS = [
+    r"HKLM\SOFTWARE\WOW6432Node\JavaPOS",
+    r"HKLM\SOFTWARE\JavaPOS",
+]
+
+
+def check_opos_registry():
+    """
+    Check OPOS service object registrations via Windows registry.
+    Essential for diagnosing OPOS error 107 (service not registered).
+    """
+    log.section("OPOS/JavaPOS SERVICE OBJECT CHECK (Windows)")
+
+    if platform.system() != "Windows":
+        log.write("  [!] OPOS is Windows-only — skipping")
+        return
+
+    found_any = False
+
+    for reg_base in OPOS_REGISTRY_PATHS:
+        for category in OPOS_DEVICE_CATEGORIES:
+            key_path = f'{reg_base}\\{category}'
+            cmd = ["reg", "query", key_path, "/s"]
+            out = run_system_command(cmd, timeout=5)
+            if out.strip():
+                found_any = True
+                log.write(f"  ✓ {category}:")
+                for line in out.strip().splitlines():
+                    stripped = line.strip()
+                    if stripped and "SOFTWARE" in stripped and stripped.endswith(category):
+                        # Header line — skip
+                        continue
+                    if stripped:
+                        log.write(f"      {stripped}")
+
+    if not found_any:
+        log.write("  [!] No OPOS service objects found in Windows registry")
+        log.add_troubleshooting_note(
+            "No OPOS service objects registered. If SMS shows OPOS error 107, "
+            "the service objects need to be installed/re-registered via OPOS config utility."
+        )
+        log.add_troubleshooting_note(
+            "Try: re-run OPOS configuration, or install from manufacturer's OPOS driver package."
+        )
+    else:
+        log.write("\n  ✓ OPOS service objects detected — service layer appears configured")
+
+    # Also check JavaPOS
+    for reg_base in JAVAPOS_REGISTRY_PATHS:
+        cmd = ["reg", "query", reg_base, "/s"]
+        out = run_system_command(cmd, timeout=5)
+        if out.strip():
+            log.write(f"\n  ✓ JavaPOS registry keys found at {reg_base}")
+            log.write("  (JavaPOS control objects detected)")
+            return
+
+    log.write("\n  [!] No JavaPOS registry keys found")
+    log.add_troubleshooting_note(
+        "JavaPOS not detected in registry. If the store uses JavaPOS drivers, "
+        "they may need reinstallation."
+    )
+
+
+def check_opos_specific_device(device_category: str, device_name: str = ""):
+    """
+    Check a specific OPOS device category and optionally a specific device name.
+    Call from menu for targeted OPOS troubleshooting.
+    """
+    log.section(f"OPOS CHECK: {device_category}")
+
+    if platform.system() != "Windows":
+        log.write("  [!] OPOS is Windows-only")
+        return
+
+    found = False
+    for reg_base in OPOS_REGISTRY_PATHS:
+        key_path = f'{reg_base}\\{device_category}'
+        cmd = ["reg", "query", key_path, "/s"]
+        out = run_system_command(cmd, timeout=5)
+        if out.strip():
+            found = True
+            log.write(f"  Found entries in {key_path}:")
+            for line in out.strip().splitlines():
+                stripped = line.strip()
+                if stripped:
+                    log.write(f"    {stripped}")
+
+    if not found:
+        log.write(f"  [!] No OPOS entries found for {device_category}")
+        log.add_troubleshooting_note(
+            f"OPOS category '{device_category}' has no registered service objects. "
+            f"This will cause OPOS error 107."
+        )
 
 
 # ─────────────────────────────────────────────
 # CONFIGURATION MANAGEMENT
 # ─────────────────────────────────────────────
 
-def save_config(store_name: str, config: dict):
-    """Save store-specific configuration to JSON file."""
-    CONFIG_DIR.mkdir(exist_ok=True)
-    safe_name = store_name.replace(" ", "_").lower()
-    path = CONFIG_DIR / f"{safe_name}.json"
-    with open(path, "w") as f:
+def validate_store_config(config: dict) -> list:
+    """Validate a store config and return list of errors."""
+    errors = []
+    for field, expected_type in STORE_CONFIG_REQUIRED_FIELDS.items():
+        if field not in config:
+            errors.append(f"Missing required field: {field}")
+        elif not isinstance(config[field], expected_type):
+            errors.append(f"Field '{field}' should be {expected_type.__name__}, got {type(config[field]).__name__}")
+    if "endpoints" in config and isinstance(config["endpoints"], list):
+        for i, ep in enumerate(config["endpoints"]):
+            if not isinstance(ep, (list, tuple)) or len(ep) < 3:
+                errors.append(f"endpoints[{i}] should be [ip, port, label]")
+    return errors
+
+
+def save_config():
+    """Interactive: save current store configuration."""
+    log.section("SAVE STORE CONFIGURATION")
+
+    name = input("  Store name: ").strip()
+    if not name:
+        log.write("  [!] Cancelled — store name required")
+        return
+
+    address = input("  Store address: ").strip()
+
+    print("  Enter custom network endpoints (IP, Port, Label)")
+    print("  One per line. Empty line to finish.")
+    print("  Example: 10.0.0.5 443 VHQ Server")
+    endpoints = []
+    while True:
+        ep_raw = input("  Endpoint: ").strip()
+        if not ep_raw:
+            break
+        parts = ep_raw.split()
+        if len(parts) >= 3:
+            try:
+                ip, port_str, label = parts[0], parts[1], " ".join(parts[2:])
+                endpoints.append((ip, int(port_str), label))
+            except ValueError:
+                log.write("  [!] Invalid port number, skipping")
+        else:
+            log.write("  [!] Expected: IP PORT LABEL, skipping")
+
+    notes = input("  Notes (optional): ").strip()
+
+    config = {
+        "store_name": name,
+        "store_address": address,
+        "endpoints": endpoints,
+        "notes": notes,
+        "saved_at": datetime.datetime.now().isoformat(),
+    }
+
+    errors = validate_store_config(config)
+    if errors:
+        log.write("  Validation errors:")
+        for err in errors:
+            log.write(f"    ✗ {err}")
+        return
+
+    filepath = CONFIG_DIR / f"{name.replace(' ', '_').lower()}.json"
+    with open(filepath, "w") as f:
         json.dump(config, f, indent=2)
-    log.write(f"  Config saved: {path}")
+
+    log.write(f"  ✓ Configuration saved to {filepath}")
+    log.set_store(name)
 
 
-def load_config(store_name: str) -> dict:
-    """Load a previously saved store configuration."""
-    safe_name = store_name.replace(" ", "_").lower()
-    path = CONFIG_DIR / f"{safe_name}.json"
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)
-    return {}
+def load_config_and_quick_test():
+    """Load a store config and run targeted tests based on its endpoints."""
+    log.section("QUICK TEST FROM CONFIG")
+
+    configs = list(CONFIG_DIR.glob("*.json"))
+    if not configs:
+        log.write("  No saved configurations found.")
+        log.write("  Use option 9 to save a config first.")
+        return
+
+    log.write("  Available store configs:")
+    for i, c in enumerate(configs, 1):
+        try:
+            with open(c) as f:
+                data = json.load(f)
+            store_name = data.get("store_name", c.stem)
+            log.write(f"  [{i}] {store_name}")
+        except (json.JSONDecodeError, OSError):
+            log.write(f"  [{i}] {c.stem} (broken file)")
+
+    try:
+        choice = int(input("\n  Select config: ").strip())
+        if choice < 1 or choice > len(configs):
+            log.write("  [!] Invalid selection")
+            return
+    except (ValueError, IndexError):
+        log.write("  [!] Invalid selection")
+        return
+
+    try:
+        with open(configs[choice - 1]) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.write(f"  [!] Could not load config: {e}")
+        return
+
+    log.set_store(config.get("store_name", "Unknown"))
+    log.section(f"QUICK TEST — {config.get('store_name', 'Unknown')}")
+
+    # Run targeted tests
+    endpoints = config.get("endpoints", [])
+    if endpoints:
+        test_network_parallel(endpoints)
+    else:
+        log.write("  No custom endpoints in config — skipping network test")
+
+    # Always do serial + USB scan
+    test_all_ports_simultaneous()
+    scan_usb_devices()
+
+    # Check OPOS if on Windows
+    check_opos_registry()
 
 
 def list_configs():
-    """List all saved store configurations."""
-    CONFIG_DIR.mkdir(exist_ok=True)
+    """List saved store configurations with metadata."""
+    log.section("SAVED CONFIGURATIONS")
     configs = list(CONFIG_DIR.glob("*.json"))
     if not configs:
         log.write("  No saved configurations found.")
         return
     log.write(f"  Saved configs ({len(configs)}):")
     for c in configs:
-        log.write(f"    • {c.stem}")
+        try:
+            with open(c) as f:
+                data = json.load(f)
+            name = data.get("store_name", c.stem)
+            address = data.get("store_address", "No address")
+            ep_count = len(data.get("endpoints", []))
+            saved = data.get("saved_at", "")[:10]
+            log.write(f"    • {name}")
+            log.write(f"      Location: {address} | Endpoints: {ep_count} | Saved: {saved}")
+        except (json.JSONDecodeError, OSError):
+            log.write(f"    • {c.stem} (broken — delete and recreate)")
 
 
 # ─────────────────────────────────────────────
@@ -632,71 +952,79 @@ def list_configs():
 
 def full_diagnostics():
     """
-    Run ALL diagnostic checks in sequence:
-    1. System info
-    2. Serial port scan
-    3. USB device scan
-    4. Network tests
-    5. Ping gateway
+    Run ALL diagnostic checks in one go.
+    Uses simultaneous serial scan (fastest), no redundant double-scanning.
     """
-    log.section(f"{APP_NAME} v{VERSION} — FULL SYSTEM DIAGNOSTICS")
+    log.section(f"{APP_NAME} v{VERSION} \u2014 FULL SYSTEM DIAGNOSTICS")
     log.write(f"  Date/Time : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.write(f"  Hostname  : {socket.gethostname()}")
     log.write(f"  OS        : {platform.system()} {platform.release()}")
     log.write(f"  Log file  : {log.log_file}")
+    admin_status = 'Yes' if is_admin() else 'No - limited functionality'
+    log.write(f"  Admin     : {admin_status}")
 
-    # 1. Serial ports — run BOTH sequential and simultaneous for full picture
-    test_all_ports_simultaneous()   # Fast scan first (all at once)
-    test_all_ports_sequential()     # Then sequential for detailed output
+    # 1. Serial ports \u2014 simultaneous scan only (fast, no redundant testing)
+    test_all_ports_simultaneous()
 
-    # 2. USB devices — scan + connection test
+    # 2. USB devices
     scan_usb_devices()
     test_usb_connections()
 
-    # 3. Network
+    # 3. Network (default endpoints)
     test_network_parallel()
 
-    # 4. Ping gateway
+    # 4. Ping key hosts
     log.section("PING TEST")
     for host in ["8.8.8.8", "192.168.1.1"]:
         result = ping_host(host)
-        log.result(host, "OK" if "FAIL" not in result else "FAIL", result)
+        is_ok = "FAIL" not in result
+        log.result(host, "OK" if is_ok else "FAIL", result)
 
-    log.section("DIAGNOSTICS COMPLETE")
+    # 5. OPOS check (Windows only)
+    check_opos_registry()
+
+    log.section(f"DIAGNOSTICS COMPLETE")
     log.write(f"  Full log saved to: {log.log_file}")
-    log.write("  Copy log content into your ticket remarks.\n")
+    log.write("")
+    log.print_ticket_block()
 
 
-# ─────────────────────────────────────────────
+# \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 # INTERACTIVE MENU
-# ─────────────────────────────────────────────
+# \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
 def print_menu():
-    print("\n" + "=" * 60)
-    print(f"  {APP_NAME} v{VERSION}")
-    print(f"  Author: Christian J. Sanchez Avila — AM PM Services")
+    print()
     print("=" * 60)
-    print("  [1] Full System Diagnostics (recommended)")
-    print("  [2] Test Serial Ports — Sequential (one by one)")
-    print("  [3] Test Serial Ports — Simultaneous (all at once, fastest)")
-    print("  [4] Scan USB Devices (list all)")
-    print("  [5] Test USB Connections (status + type check)")
-    print("  [6] Network Tests (Parallel)")
-    print("  [7] Ping Test")
-    print("  [8] List Saved Configs")
-    print("  [0] Exit")
+    print(f"  {APP_NAME} v{VERSION}")
+    print(f"  Author: Christian J. Sanchez Avila \u2014 AM PM Services")
+    print("=" * 60)
+    print("  [1]  Full System Diagnostics (recommended)")
+    print("  [2]  Test Serial Ports (Simultaneous)")
+    print("  [3]  Scan USB Devices")
+    print("  [4]  Test USB Connections")
+    print("  [5]  Network Tests (Parallel)")
+    print("  [6]  Ping Test")
+    print("  [7]  OPOS/JavaPOS Check (Windows)")
+    print("  [8]  Quick Test from Config")
+    print("  [9]  Save Store Config")
+    print("  [10] List Saved Configs")
+    print("  [0]  Exit")
     print("-" * 60)
 
 
 def main():
     """
-    Main entry point. Displays an interactive menu so field techs
-    can run any diagnostic check with a single keypress.
-    Double-click the .exe to start — no command-line arguments needed.
+    Main entry point.
+    Double-click the .exe to start \u2014 no arguments needed.
     """
-    # Ensure log and config dirs exist
     LOG_DIR.mkdir(exist_ok=True)
     CONFIG_DIR.mkdir(exist_ok=True)
+
+    print()
+    print(f"  {APP_NAME} v{VERSION}")
+    print(f"  Starting up...")
+    check_elevation()
 
     while True:
         print_menu()
@@ -709,25 +1037,32 @@ def main():
         if choice == "1":
             full_diagnostics()
         elif choice == "2":
-            test_all_ports_sequential()
-        elif choice == "3":
             test_all_ports_simultaneous()
-        elif choice == "4":
+        elif choice == "3":
             scan_usb_devices()
-        elif choice == "5":
+        elif choice == "4":
             test_usb_connections()
-        elif choice == "6":
+        elif choice == "5":
             test_network_parallel()
-        elif choice == "7":
+        elif choice == "6":
             log.section("PING TEST")
             host = input("  Enter host to ping [default: 8.8.8.8]: ").strip() or "8.8.8.8"
             result = ping_host(host)
-            log.result(host, "OK" if "FAIL" not in result else "FAIL", result)
+            is_ok = "FAIL" not in result
+            log.result(host, "OK" if is_ok else "FAIL", result)
+        elif choice == "7":
+            check_opos_registry()
         elif choice == "8":
-            log.section("SAVED CONFIGURATIONS")
+            load_config_and_quick_test()
+        elif choice == "9":
+            save_config()
+        elif choice == "10":
             list_configs()
         elif choice == "0":
-            print("  Goodbye!")
+            print()
+            log.write("  Goodbye!")
+            print()
+            log.print_ticket_block()
             break
         else:
             print("  [!] Invalid choice. Please try again.")

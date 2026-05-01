@@ -12,6 +12,16 @@
 6. **Enhanced Logging** - SMS Loc/CRC Dispatch ready
 7. **Full System Diagnostics** - Complete check in one command
 
+### ✅ **v3.1.0 Features (COMPLETE):**
+1. **Fixed** - Full Diagnostics now uses single serial scan (no redundant double-testing)
+2. **Fixed** - USB scan has auto-retry + WMIC fallback
+3. **New** - OPOS/JavaPOS registry check (diagnoses error 107 "service not registered")
+4. **New** - Admin elevation check at startup with clear instructions
+5. **New** - Structured ticket output (clean copy-paste block for work orders)
+6. **New** - External vendor_ids.json (no recompile needed for new device VIDs)
+7. **New** - Quick Test from Config option
+8. **New** - Store-specific configurable network endpoints
+
 ## 🚀 **Planned Major Improvements**
 
 ### **v4.0.0 - OPOS/JavaPOS Testing Layer**

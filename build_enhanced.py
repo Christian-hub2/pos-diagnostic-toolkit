@@ -11,7 +11,7 @@ from datetime import datetime
 
 # PyInstaller configuration
 APP_NAME = "pos-diagnostic-toolkit"
-VERSION = "3.0"
+VERSION = "3.1"
 AUTHOR = "Christian J. Sanchez Avila"
 
 # Files to include
@@ -252,6 +252,8 @@ def main():
     create_version_info()
     build_exe()
     create_readme()
+    print(f"[+] Note: Vendor ID file at src/data/vendor_ids.json is packaged alongside")
+    print(f"[+] To add new USB devices, edit that file and rebuild.")
     
     print("\n" + "=" * 60)
     print("[+] Build completed successfully!")

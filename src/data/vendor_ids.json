@@ -1,0 +1,21 @@
+{
+    "04b8": ["Epson", "Printer/Scanner"],
+    "0525": ["Verifone", "Pin Pad"],
+    "0b00": ["Ingenico", "Pin Pad/Terminal"],
+    "05e0": ["Symbol/Zebra", "Scanner"],
+    "0a5f": ["Zebra", "Scanner/Printer"],
+    "1fc9": ["NCR", "POS Device"],
+    "0403": ["FTDI", "USB-Serial Adapter"],
+    "067b": ["Prolific", "USB-Serial Adapter"],
+    "10c4": ["Silicon Labs", "USB-Serial Adapter"],
+    "1a86": ["CH340", "USB-Serial Adapter"],
+    "0557": ["ATEN", "USB-Serial/KVM"],
+    "045e": ["Microsoft", "HID/Keyboard/Mouse"],
+    "046d": ["Logitech", "HID/Keyboard/Mouse"],
+    "0458": ["KYE/Genius", "HID Device"],
+    "05ac": ["Apple", "HID/Hub"],
+    "0424": ["Microchip", "USB Hub"],
+    "2341": ["Arduino", "USB-Serial"],
+    "0451": ["Texas Instrs", "USB Hub"],
+    "1d6b": ["Linux", "USB Hub/Virtual"]
+}

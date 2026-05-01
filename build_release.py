@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Configuration
 APP_NAME = "pos-diagnostic-toolkit"
-VERSION = "3.0.0"  # Semantic versioning: MAJOR.MINOR.PATCH
+VERSION = "3.1.0"  # Semantic versioning: MAJOR.MINOR.PATCH
 AUTHOR = "Christian J. Sanchez Avila"
 COMPANY = "AM PM Services"
 COPYRIGHT = f"Copyright © {datetime.now().year} {AUTHOR}"

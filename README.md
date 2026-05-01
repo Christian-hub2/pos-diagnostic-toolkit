@@ -1,13 +1,13 @@
-# POS Diagnostic Toolkit v3.0
+# POS Diagnostic Toolkit v3.1
 
-![Version](https://img.shields.io/badge/version-3.0.0-blue)
+![Version](https://img.shields.io/badge/version-3.1.0-blue)
 ![Python](https://img.shields.io/badge/python-3.6+-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Mac-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 
 A comprehensive field technician utility for troubleshooting Point-of-Sale systems. Now with **sequential port testing**, **USB device scanning**, and **auto-detection** of POS hardware.
 
-## 🚀 What's New in v3.0
+## 🚀 What's New in v3.1
 
 ### ✅ **Your Requested Features:**
 1. **Sequential COM Port Testing** - Test ALL ports at once (saves 80% time)
@@ -191,4 +191,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Ready for daily field use!** This toolkit will save time on every troubleshooting call and make ticket documentation effortless.
 
-**Download the latest release**: [releases/v3.0.0/](releases/v3.0.0/)
+**Download the latest release**: [releases/v3.1.0/](releases/v3.1.0/)
