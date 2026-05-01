@@ -124,9 +124,29 @@ USB_DEVICE_SIGNATURES = _load_vendor_db()
 
 DEFAULT_NETWORK_ENDPOINTS = [
     ("8.8.8.8",     53,  "Google DNS"),
-    ("8.8.4.4",     53,  "Google DNS 2"),
     ("192.168.1.1",  80,  "Default Gateway"),
 ]
+
+# Known POS utility paths for detection
+POS_UTILITY_PATHS = {
+    "123Scan": [
+        r"C:\Program Files (x86)\Zebra Technologies\123Scan\123Scan.exe",
+        r"C:\Program Files\Zebra Technologies\123Scan\123Scan.exe",
+        r"C:\Program Files (x86)\Motorola\123Scan\123Scan.exe",
+        r"C:\Program Files\Motorola\123Scan\123Scan.exe",
+    ],
+    "OPOS Sample App": [
+        r"C:\Program Files (x86)\Zebra Technologies\OPOS\Sample Application\ScannerOPOSTest.exe",
+        r"C:\Program Files\Zebra Technologies\OPOS\Sample Application\ScannerOPOSTest.exe",
+        r"C:\Program Files (x86)\Zebra Technologies\OPOS\Sample Application\ScaleOPOSTest.exe",
+        r"C:\Program Files\Zebra Technologies\OPOS\Sample Application\ScaleOPOSTest.exe",
+    ],
+    "SMS Store Manager": [
+        r"C:\Program Files (x86)\SMS\StoreMan\storeman.exe",
+        r"C:\Program Files\SMS\StoreMan\storeman.exe",
+        r"C:\storeman\storeman.exe",
+    ],
+}
 
 STORE_CONFIG_REQUIRED_FIELDS = {
     "store_name": str,
@@ -242,19 +262,41 @@ def is_admin() -> bool:
         return os.geteuid() == 0
 
 
+def _relaunch_as_admin_windows():
+    """Auto-relaunch with admin privileges on Windows."""
+    try:
+        import ctypes
+        args = ' '.join(f'"{a}"' for a in sys.argv)
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args, None, 1)
+        if ret > 32:
+            print("  [*] Relaunching as administrator...")
+            sys.exit(0)
+        else:
+            print("  [!] Admin elevation cancelled.")
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def check_elevation():
-    """Warn if not running as admin. On Windows, offer to relaunch."""
+    """Check admin status. On Windows .exe, offer auto-relaunch."""
     if is_admin():
-        log.write("  ✓ Running with admin privileges")
+        log.write("  * Running with admin privileges")
         return
 
-    log.write("  ⚠ WARNING: Not running as administrator")
-    log.write("  Some features (serial ports, USB scanning) may not work fully.")
-    log.write("  Recommend restarting with admin rights.")
+    log.write("  ! WARNING: Not running as administrator")
+    log.write("  Some features (serial ports, USB scanning) may not work.")
 
     if platform.system() == "Windows":
-        log.write("  → Right-click the .exe and select 'Run as Administrator'")
-        log.write("  → Or run from an elevated Command Prompt")
+        log.write("")
+        log.write("  [A] Auto-relaunch as Administrator")
+        log.write("  [S] Skip - continue with limited functionality")
+        confirm = input("  Choice: ").strip().upper()
+        if confirm == "A":
+            _relaunch_as_admin_windows()
+            return
+        log.write("  Continuing without admin privileges.")
 
     log.add_troubleshooting_note(
         "Ran without admin elevation. Some USB/serial operations may have limited results."
@@ -598,6 +640,70 @@ def test_usb_connections():
     except Exception as e:
         log.write(f"  [!] USB connection test error: {e}")
         log.add_troubleshooting_note(f"USB connection test error: {e}")
+
+
+# ─────────────────────────────────────────────
+# POS UTILITY DETECTION (123Scan, OPOS Tools, SMS)
+# ─────────────────────────────────────────────
+
+def find_pos_utilities() -> dict:
+    """Scan standard install paths for known POS utilities."""
+    found = {}
+    if platform.system() != "Windows":
+        for name in POS_UTILITY_PATHS:
+            found[name] = None
+        return found
+
+    for name, paths in POS_UTILITY_PATHS.items():
+        for path in paths:
+            if os.path.isfile(path):
+                found[name] = path
+                break
+        else:
+            found[name] = None
+    return found
+
+
+def check_pos_utilities():
+    """Check for and report installed POS utilities."""
+    log.section("POS UTILITY CHECK (123Scan, OPOS Tools, SMS)")
+    found = find_pos_utilities()
+    any_found = False
+    for name, path in found.items():
+        if path:
+            any_found = True
+            log.result(name, "INSTALLED", path)
+        else:
+            log.write(f"  - {name}: Not found")
+
+    if not any_found and platform.system() == "Windows":
+        log.add_troubleshooting_note(
+            "No POS utilities (123Scan, OPOS tools) detected on this machine. "
+            "These are essential for device configuration."
+        )
+        log.write("")
+        log.write("  123Scan: https://www.zebra.com/us/en/support-downloads/software/123scan.html")
+        log.write("  OPOS: Installed from manufacturer driver package or Zebra website")
+
+    return found
+
+
+def launch_123scan():
+    """Launch 123Scan if installed."""
+    log.section("LAUNCH 123SCAN")
+    found = find_pos_utilities()
+    path = found.get("123Scan")
+    if path:
+        log.write(f"  Starting 123Scan from: {path}")
+        try:
+            subprocess.Popen([path], shell=True)
+            log.write("  123Scan launched in a separate window.")
+        except Exception as e:
+            log.write(f"  [!] Failed to launch: {e}")
+    else:
+        log.write("  123Scan is not installed on this machine.")
+        log.write("  You can download it from: https://www.zebra.com/us/en/support-downloads/software/123scan.html")
+        log.add_troubleshooting_note("123Scan not installed - needed for scanner/scale configuration.")
 
 
 # ─────────────────────────────────────────────
@@ -983,6 +1089,9 @@ def full_diagnostics():
     # 5. OPOS check (Windows only)
     check_opos_registry()
 
+    # 6. POS utility check (123Scan, OPOS Tools, SMS)
+    check_pos_utilities()
+
     log.section(f"DIAGNOSTICS COMPLETE")
     log.write(f"  Full log saved to: {log.log_file}")
     log.write("")
@@ -1009,6 +1118,8 @@ def print_menu():
     print("  [8]  Quick Test from Config")
     print("  [9]  Save Store Config")
     print("  [10] List Saved Configs")
+    print("  [11] Check POS Utilities (123Scan, OPOS Tools, SMS)")
+    print("  [12] Launch 123Scan")
     print("  [0]  Exit")
     print("-" * 60)
 
@@ -1058,6 +1169,10 @@ def main():
             save_config()
         elif choice == "10":
             list_configs()
+        elif choice == "11":
+            check_pos_utilities()
+        elif choice == "12":
+            launch_123scan()
         elif choice == "0":
             print()
             log.write("  Goodbye!")
